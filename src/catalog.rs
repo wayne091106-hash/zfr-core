@@ -1,4 +1,4 @@
-//! Model Catalog & Lane Definitions for OpenCode Zen and Kilo Free Pool.
+//! Model Catalog & Route Lane Definitions for OpenCode and Kilo Endpoints.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ pub struct ModelEntry {
 
 pub fn builtin_catalog() -> Vec<ModelEntry> {
     vec![
-        // OpenCode Zen Free Lane
+        // OpenCode Lane
         ModelEntry {
             id: "beam-free".into(),
             lane: Lane::OpenCodeZen,
@@ -106,7 +106,7 @@ pub fn builtin_catalog() -> Vec<ModelEntry> {
             vision: false,
             reasoning: true,
         },
-        // Kilo Free Pool Lane
+        // Kilo Lane
         ModelEntry {
             id: "kilo-auto/free".into(),
             lane: Lane::KiloFree,
@@ -247,7 +247,7 @@ pub fn resolve_model(raw: &str) -> (Lane, String) {
     }
 }
 
-/// Ordered failover chain when all exits for `primary` are exhausted or unavailable.
+/// Ordered failover chain when all egress paths for `primary` are unavailable.
 pub fn failover_chain(primary: &str) -> Vec<(Lane, String)> {
     let (primary_lane, primary_id) = resolve_model(primary);
     let mut chain = vec![(primary_lane, primary_id.clone())];
@@ -268,4 +268,80 @@ pub fn failover_chain(primary: &str) -> Vec<(Lane, String)> {
         }
     }
     chain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_model_prefixes_and_aliases() {
+        assert_eq!(
+            resolve_model("opencode/beam-free"),
+            (Lane::OpenCodeZen, "beam-free".to_string())
+        );
+        assert_eq!(
+            resolve_model("kilo/kilo-auto/free"),
+            (Lane::KiloFree, "kilo-auto/free".to_string())
+        );
+        assert_eq!(
+            resolve_model("nvidia/nemotron-3.5-lightning:free"),
+            (
+                Lane::KiloFree,
+                "nvidia/nemotron-3.5-lightning:free".to_string()
+            )
+        );
+        assert_eq!(
+            resolve_model("auto"),
+            (Lane::OpenCodeZen, "beam-free".to_string())
+        );
+        assert_eq!(
+            resolve_model("code"),
+            (Lane::OpenCodeZen, "deepseek-v4.1-flash-free".to_string())
+        );
+        assert_eq!(
+            resolve_model("vision"),
+            (
+                Lane::KiloFree,
+                "nvidia/nemotron-3.5-super-vl:free".to_string()
+            )
+        );
+        assert_eq!(
+            resolve_model("beam-free"),
+            (Lane::OpenCodeZen, "beam-free".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_strips_role_suffix() {
+        assert_eq!(
+            resolve_model("beam-free(fast)"),
+            (Lane::OpenCodeZen, "beam-free".to_string())
+        );
+    }
+
+    #[test]
+    fn failover_chain_starts_with_primary_and_no_duplicates() {
+        let chain = failover_chain("deepseek-v4.1-flash-free");
+        assert_eq!(
+            chain[0],
+            (Lane::OpenCodeZen, "deepseek-v4.1-flash-free".to_string())
+        );
+        let unique: std::collections::HashSet<_> = chain
+            .iter()
+            .map(|(l, m)| (format!("{l:?}"), m.clone()))
+            .collect();
+        assert_eq!(unique.len(), chain.len(), "chain entries must be unique");
+        assert!(chain.len() > 5, "failover chain should offer fallbacks");
+    }
+
+    #[test]
+    fn failover_chain_primary_not_repeated() {
+        let chain = failover_chain("beam-free");
+        let count = chain
+            .iter()
+            .filter(|(l, m)| *l == Lane::OpenCodeZen && m == "beam-free")
+            .count();
+        assert_eq!(count, 1);
+    }
 }

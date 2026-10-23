@@ -1,9 +1,9 @@
-//! OpenCode v2.1.3 Free-Tier Gate Fingerprint Engine.
+//! OpenCode v2.1.3 Wire Protocol Compatibility & Session Header Formatter.
 //!
-//! Handles the three mandatory checks enforced by OpenCode's `inference-next` gate:
-//! 1. Descending 48-bit inverted millisecond timestamp in `x-opencode-session` (`ses_<12hex><14base62>`).
-//! 2. Mandatory `stream: true` on upstream requests (with local SSE-to-JSON aggregation when downstream wants `stream: false`).
-//! 3. Mandatory `read` and `shell` tool declarations in `tools` (with transparent aliasing when the caller defines its own `read`/`shell`).
+//! Implements protocol framing and session specifications matching OpenCode v2.1.3 client:
+//! 1. Formatted 48-bit inverted timestamp in `x-opencode-session` (`ses_<12hex><14base62>`).
+//! 2. Mandatory `stream: true` upstream framing (with local SSE-to-JSON aggregation for non-streaming downstream clients).
+//! 3. Standard tool schema declarations (with schema aliasing when downstream defines custom tools).
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -24,12 +24,14 @@ const REAL_SHELL_DESC: &str = "Execute a shell command and return its output. Co
 
 const NOTE_NO_TOOLS: &str = "Do not call the `read` or `shell` tools; they are placeholders that do nothing. Reply directly without invoking tools.";
 const NOTE_PLACEHOLDER_TOOLS: &str = "Do not call the `read` or `shell` tools; they are placeholders that do nothing. Use the other tools you have been given instead.";
-const NOTE_ALIASED_TOOLS: &str = "The `read` and `shell` entries in the tool list are inert placeholders -- never call them. To read files or run commands, call `read_client` and `shell_client` instead.";
+const NOTE_ALIASED_BOTH: &str = "The `read` and `shell` entries in the tool list are inert placeholders -- never call them. To read files or run commands, call `read_client` and `shell_client` instead.";
+const NOTE_ALIASED_READ_ONLY: &str = "The `read` and `shell` entries in the tool list are inert placeholders -- never call them. To read files, call `read_client`; to run commands, use your other provided command tool (such as `bash`).";
+const NOTE_ALIASED_SHELL_ONLY: &str = "The `read` and `shell` entries in the tool list are inert placeholders -- never call them. To run commands, call `shell_client`; to read files, use your other provided file tool.";
 
-/// Mint an OpenCode v2.1.3 descending session ID: `ses_<12-hex-inv-ts><14-base62>`.
+/// Formats an OpenCode v2.1.3 session identifier: `ses_<12-hex-inv-ts><14-base62>`.
 ///
-/// Upstream decodes the first 12 hex characters as `~((ms << 12) | seq) & 0xffff_ffff_ffff`
-/// and verifies that the timestamp is fresh (within ~6 days).
+/// The first 12 hex characters encode `~((ms << 12) | seq) & 0xffff_ffff_ffff`
+/// verifying session freshness and monotonic sequencing.
 pub fn mint_session_id(now_ms_override: Option<u64>) -> String {
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let now_ms = now_ms_override.unwrap_or_else(|| d.as_millis() as u64);
@@ -65,9 +67,9 @@ pub fn decode_session_timestamp_ms(session_id: &str) -> Option<u64> {
 
 /// Binds `(conversation_seed, exit_key)` to a stable, fresh `ses_...` ID.
 ///
-/// Quota and prompt caching are tracked per session AND per egress IP.
+/// Session state and prompt caching are tracked per session and egress path.
 /// Binding one session per `(conversation, exit_key)` preserves prompt cache hits
-/// on the same exit while preventing cross-country session correlation when rotating exits.
+/// on the same connection while maintaining isolated session state across multi-homed paths.
 pub struct SessionLedger {
     inner: Mutex<HashMap<String, (String, Instant)>>,
     remint_after: Duration,
@@ -197,8 +199,8 @@ pub struct FingerprintPlan {
     pub aliased_client_tools: bool,
 }
 
-/// Mutates an OpenAI chat completion request body in-place so it passes the OpenCode
-/// `inference-next` free-tier gate (`403 FreeTierError`).
+/// Normalizes an OpenAI chat completion request body to conform to OpenCode v2.1.3
+/// wire protocol framing requirements.
 pub fn apply_fingerprint(body: &mut Value) -> FingerprintPlan {
     let downstream_wants_stream = body
         .get("stream")
@@ -211,14 +213,14 @@ pub fn apply_fingerprint(body: &mut Value) -> FingerprintPlan {
         body["stream_options"] = json!({"include_usage": true});
     }
 
-    // 2. Strip tool_choice: "none" (upstream returns 403 if tool_choice is "none")
+    // 2. Normalize tool_choice: strip unsupported "none" value for upstream compatibility
     if body.get("tool_choice").and_then(|v| v.as_str()) == Some("none") {
         if let Some(obj) = body.as_object_mut() {
             obj.remove("tool_choice");
         }
     }
 
-    // 3. Inspect and alias/inject tools
+    // 3. Inspect and normalize/alias tool schemas
     let existing_tools = body
         .get("tools")
         .and_then(|v| v.as_array())
@@ -226,7 +228,8 @@ pub fn apply_fingerprint(body: &mut Value) -> FingerprintPlan {
         .unwrap_or_default();
 
     let caller_had_no_tools = existing_tools.is_empty();
-    let mut aliased = false;
+    let mut aliased_read = false;
+    let mut aliased_shell = false;
     let mut out_tools = Vec::with_capacity(existing_tools.len() + 2);
 
     for mut t in existing_tools {
@@ -245,7 +248,11 @@ pub fn apply_fingerprint(body: &mut Value) -> FingerprintPlan {
             let is_exact = (name == "read" && desc == REAL_READ_DESC)
                 || (name == "shell" && desc == REAL_SHELL_DESC);
             if !is_exact {
-                aliased = true;
+                if name == "read" {
+                    aliased_read = true;
+                } else {
+                    aliased_shell = true;
+                }
                 if let Some(f) = t.get_mut("function").and_then(|f| f.as_object_mut()) {
                     f.insert("name".into(), json!(format!("{name}_client")));
                 }
@@ -284,6 +291,7 @@ pub fn apply_fingerprint(body: &mut Value) -> FingerprintPlan {
         body["max_completion_tokens"] = json!(32000);
     }
 
+    let aliased = aliased_read || aliased_shell;
     // 4. If we aliased client `read`/`shell` tools, also alias historical assistant tool_calls
     if aliased {
         if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -292,7 +300,7 @@ pub fn apply_fingerprint(body: &mut Value) -> FingerprintPlan {
                     for tc in tcs.iter_mut() {
                         if let Some(f) = tc.get_mut("function").and_then(|f| f.as_object_mut()) {
                             if let Some(n) = f.get("name").and_then(|n| n.as_str()) {
-                                if n == "read" || n == "shell" {
+                                if (n == "read" && aliased_read) || (n == "shell" && aliased_shell) {
                                     f.insert("name".into(), json!(format!("{n}_client")));
                                 }
                             }
@@ -303,11 +311,15 @@ pub fn apply_fingerprint(body: &mut Value) -> FingerprintPlan {
         }
     }
 
-    // 5. Add system note so the model doesn't invoke inert fingerprint tools
+    // 5. Add system guidance so the model does not invoke compatibility placeholder tools
     let note = if caller_had_no_tools {
         NOTE_NO_TOOLS
-    } else if aliased {
-        NOTE_ALIASED_TOOLS
+    } else if aliased_read && aliased_shell {
+        NOTE_ALIASED_BOTH
+    } else if aliased_read {
+        NOTE_ALIASED_READ_ONLY
+    } else if aliased_shell {
+        NOTE_ALIASED_SHELL_ONLY
     } else {
         NOTE_PLACEHOLDER_TOOLS
     };
@@ -442,5 +454,33 @@ mod tests {
         assert!(names.contains(&"read"));
         assert!(names.contains(&"shell"));
         assert_eq!(unalias_tool_name("read_client"), "read");
+    }
+
+    #[test]
+    fn encode_v2_chat_body_orders_keys_and_keeps_raw_symbols() {
+        let body = json!({
+            "max_completion_tokens": 32000,
+            "stream": true,
+            "messages": [{"role": "user", "content": "a<b>&c"}],
+            "tools": [],
+            "model": "beam-free",
+            "stream_options": {"include_usage": true}
+        });
+        let s = encode_v2_chat_body(&body);
+        let model_pos = s.find("\"model\"").unwrap();
+        let messages_pos = s.find("\"messages\"").unwrap();
+        let tools_pos = s.find("\"tools\"").unwrap();
+        let stream_pos = s.find("\"stream\"").unwrap();
+        let so_pos = s.find("\"stream_options\"").unwrap();
+        let mct_pos = s.find("\"max_completion_tokens\"").unwrap();
+        assert!(
+            model_pos < messages_pos
+                && messages_pos < tools_pos
+                && tools_pos < stream_pos
+                && stream_pos < so_pos
+                && so_pos < mct_pos,
+            "unexpected key order: {s}"
+        );
+        assert!(s.contains("a<b>&c"), "must not HTML-escape: {s}");
     }
 }

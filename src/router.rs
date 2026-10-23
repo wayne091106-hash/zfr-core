@@ -1,4 +1,4 @@
-//! Core Request Router, Multi-Exit Executor & SSE Aggregator.
+//! Core Request Router, Multi-Homed Dispatcher & Upstream SSE Stream Normalization.
 
 use crate::catalog::{
     builtin_catalog, failover_chain, resolve_model, Lane, KILO_GATEWAY_BASE, OPENCODE_ZEN_BASE,
@@ -57,7 +57,7 @@ impl Router {
         }
     }
 
-    /// Probe a single model on the first healthy exit (rotating on failure).
+    /// Probe endpoint health for a single model across healthy egress paths.
     pub async fn probe_model(&self, model: &str) -> ProbeReport {
         let (lane, canonical) = resolve_model(model);
         let req = json!({
@@ -120,7 +120,7 @@ impl Router {
         last_report
     }
 
-    /// Probe all built-in OpenCode Zen and Kilo Free models concurrently.
+    /// Probe all catalog model endpoints concurrently.
     pub async fn probe_all(self: &Arc<Self>) -> Vec<ProbeReport> {
         let entries = builtin_catalog();
         let mut tasks = Vec::with_capacity(entries.len());
@@ -137,7 +137,63 @@ impl Router {
         out
     }
 
-    /// Execute a chat completion request with multi-exit IP rotation and optional model failover.
+    /// Quota-aware probe sweep for the background prober.
+    ///
+    /// Models whose every exit is on cooldown are reported as `skipped` without
+    /// touching the upstream, so exhausted quotas are not probed (and their
+    /// server-provided cooldown windows are not needlessly renewed). Models with
+    /// at least one healthy exit are probed normally across the healthy paths.
+    pub async fn probe_available_models(self: &Arc<Self>) -> Vec<ProbeReport> {
+        let cooldowns = self.egress.active_cooldowns();
+        let cooldown_by_model: std::collections::HashMap<String, (u64, String)> = cooldowns
+            .iter()
+            .map(|c| (c.model.clone(), (c.remaining_secs, c.class_str().to_string())))
+            .collect();
+
+        let entries = builtin_catalog();
+        let mut pre: Vec<Option<ProbeReport>> = Vec::with_capacity(entries.len());
+        let mut tasks = Vec::new();
+        for entry in entries {
+            if !self.egress.model_has_healthy_exit(&entry.id) {
+                let (secs, class) = cooldown_by_model
+                    .get(&entry.id)
+                    .cloned()
+                    .unwrap_or((0, "cooldown".to_string()));
+                pre.push(Some(ProbeReport {
+                    model: entry.id,
+                    lane: entry.lane,
+                    exit_id: "none".into(),
+                    status: 0,
+                    ok: false,
+                    latency_ms: 0,
+                    detail: format!("skipped: all exits on cooldown ({class}, {secs}s left)"),
+                }));
+                continue;
+            }
+            pre.push(None);
+            let r = Arc::clone(self);
+            let model = entry.id.clone();
+            tasks.push(tokio::spawn(async move { r.probe_model(&model).await }));
+        }
+
+        let mut tasks = tasks.into_iter();
+        let mut out = Vec::with_capacity(pre.len());
+        for slot in pre {
+            match slot {
+                Some(rep) => out.push(rep),
+                None => {
+                    if let Some(handle) = tasks.next() {
+                        if let Ok(rep) = handle.await {
+                            out.push(rep);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Execute a chat completion request with multi-homed egress routing and optional failover.
     pub async fn execute_chat(&self, raw_body: Value) -> Result<RoutedResponse, (u16, Value)> {
         let requested_model = raw_body
             .get("model")
@@ -317,7 +373,7 @@ fn extract_error_message(raw: &str, retry_after: Option<u64>) -> String {
     }
 }
 
-/// Rewrites SSE lines on the fly to unalias `read_client`/`shell_client` or strip inert placeholder tool calls.
+/// Rewrites SSE stream lines to restore client tool names or remove compatibility placeholders.
 fn build_filtered_sse_stream(resp: reqwest::Response, plan: FingerprintPlan) -> ByteStream {
     let s = futures::stream::unfold(
         (resp.bytes_stream(), String::new(), plan),
@@ -392,10 +448,9 @@ fn rewrite_sse_line(line: &str, plan: &FingerprintPlan) -> Option<String> {
     Some(format!("data: {}\n\n", v))
 }
 
-/// Aggregates an upstream SSE stream into a single non-streaming OpenAI `chat.completion` JSON object.
+/// Normalizes and aggregates an upstream SSE stream into a standard non-streaming OpenAI `chat.completion` JSON object.
 ///
-/// Also avoids the `zen-gate` Issue #105 bug where cumulative `usage` chunks were summed together:
-/// we overwrite `latest_usage` with the newest non-null usage block rather than adding cumulative frames.
+/// Preserves the latest non-null token usage block rather than accumulating partial frames.
 async fn aggregate_sse_to_json(
     resp: reqwest::Response,
     served_model: &str,
@@ -534,4 +589,87 @@ async fn aggregate_sse_to_json(
         out["usage"] = u;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprint::FingerprintPlan;
+
+    #[test]
+    fn classify_maps_status_and_body() {
+        assert!(matches!(
+            classify_http_failure(429, ""),
+            FailureClass::Quota429
+        ));
+        assert!(matches!(
+            classify_http_failure(200, r#"{"error":{"message":"FreeUsageLimitError"}}"#),
+            FailureClass::Quota429
+        ));
+        assert!(matches!(
+            classify_http_failure(403, "FreeTierError: upgrade required"),
+            FailureClass::FreeTier403
+        ));
+        assert!(matches!(
+            classify_http_failure(403, "not allowed in your region"),
+            FailureClass::RegionBlock
+        ));
+        assert!(matches!(
+            classify_http_failure(502, "bad gateway"),
+            FailureClass::Upstream5xx
+        ));
+    }
+
+    #[test]
+    fn extract_error_message_appends_retry_after() {
+        let raw = r#"{"error":{"message":"rate limited"}}"#;
+        assert_eq!(
+            extract_error_message(raw, Some(30)),
+            "rate limited (Retry-After: 30s)"
+        );
+        assert_eq!(extract_error_message("plain boom", None), "plain boom");
+    }
+
+    #[test]
+    fn rewrite_sse_line_drops_placeholder_tool_calls() {
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c1"}]}}]}"#;
+        let plan = FingerprintPlan {
+            downstream_wants_stream: true,
+            drop_placeholder_tool_calls: true,
+            aliased_client_tools: false,
+        };
+        let out = rewrite_sse_line(line, &plan).unwrap();
+        assert!(!out.contains("tool_calls"), "{out}");
+    }
+
+    #[test]
+    fn rewrite_sse_line_unaliases_client_tools() {
+        let line =
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"shell_client","arguments":"{}"}}]}}]}"#;
+        let plan = FingerprintPlan {
+            downstream_wants_stream: true,
+            drop_placeholder_tool_calls: false,
+            aliased_client_tools: true,
+        };
+        let out = rewrite_sse_line(line, &plan).unwrap();
+        assert!(out.contains(r#""shell""#), "{out}");
+        assert!(!out.contains("shell_client"), "{out}");
+    }
+
+    #[test]
+    fn rewrite_sse_line_passes_through_plain_lines() {
+        let plan = FingerprintPlan {
+            downstream_wants_stream: true,
+            drop_placeholder_tool_calls: false,
+            aliased_client_tools: false,
+        };
+        assert_eq!(
+            rewrite_sse_line("data: [DONE]", &plan).as_deref(),
+            Some("data: [DONE]")
+        );
+        assert_eq!(
+            rewrite_sse_line(":keepalive", &plan).as_deref(),
+            Some(":keepalive")
+        );
+    }
 }

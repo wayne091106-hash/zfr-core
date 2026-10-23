@@ -1,8 +1,8 @@
 [package]
 name = "zfr-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "ZFR Core — High-performance Rust router & fingerprint engine for OpenCode Zen and Kilo free AI models with multi-egress IP rotation"
+description = "ZFR Core — High-performance Rust transport engine and OpenAI-compatible gateway with wire protocol normalization, multi-homed dual-stack routing and Windows service support"
 license = "MIT"
 repository = "https://github.com/wayne091106-hash/zfr-core"
 keywords = ["opencode", "zen", "llm", "router", "proxy"]
@@ -29,4 +29,13 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }
