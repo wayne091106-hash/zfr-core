@@ -1,0 +1,32 @@
+[package]
+name = "zfr-core"
+version = "0.1.0"
+edition = "2021"
+description = "ZFR Core — High-performance Rust router & fingerprint engine for OpenCode Zen and Kilo free AI models with multi-egress IP rotation"
+license = "MIT"
+repository = "https://github.com/wayne091106-hash/zfr-core"
+keywords = ["opencode", "zen", "llm", "router", "proxy"]
+categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
+
+[[bin]]
+name = "zfr"
+path = "src/main.rs"
+
+[lib]
+name = "zfr_core"
+path = "src/lib.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+bytes = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "gzip", "brotli"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
