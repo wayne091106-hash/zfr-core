@@ -1,5 +1,7 @@
 # ZFR Core — OpenCode Zen Free Model Router
 
+**ZFR Core** (`zfr-core`) 是一套以 Rust 打造的零依賴、高效能底層路由核心、CLI 與 OpenAI 相容本地閘道，免登入即可直連 **OpenCode Zen** 與 **Kilo 免費模型池**，並內建**多出口 IP 自動輪換**（支援 Cloudflare WARP `1.1.1.1` 的 IPv6/IPv4 雙棧自動切換、SOCKS5/HTTP 代理池與底層網卡 IP 綁定）。
+
 **ZFR Core** (`zfr-core`) is a high-performance, zero-dependency Rust engine, CLI, and OpenAI-compatible local gateway that unlocks direct, zero-account access to **OpenCode Zen** and **Kilo Free Pool** models with built-in **multi-egress IP rotation** (including automatic IPv6/IPv4 dual-stack switching for Cloudflare WARP `1.1.1.1`, SOCKS5/HTTP proxy pools, and network interface binding).
 
 ---
