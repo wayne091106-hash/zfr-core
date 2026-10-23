@@ -1,3 +1,5 @@
 /target
 *.pdb
 .env
+zfr-*.zip
+.release-notes.md

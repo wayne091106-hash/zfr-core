@@ -1,6 +1,6 @@
 [package]
 name = "zfr-core"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "ZFR Core — High-performance Rust transport engine and OpenAI-compatible gateway with wire protocol normalization, multi-homed dual-stack routing and Windows service support"
 license = "MIT"

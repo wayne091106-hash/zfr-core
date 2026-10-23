@@ -269,6 +269,10 @@ impl CooldownEntry {
 fn build_client_for_spec(spec: &str) -> Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(20))
+        // Per-read timeout: bounds stalled upstreams so a silent connection can
+        // never hang a probe (or a live request) forever, while long-running SSE
+        // streams that keep sending data stay alive.
+        .read_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(60))
         .tcp_keepalive(Duration::from_secs(30));
 
