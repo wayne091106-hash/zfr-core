@@ -104,6 +104,46 @@ curl http://127.0.0.1:18788/v1/chat/completions \
 
 ---
 
+## Serverless Egress Relay (Modal — 發請求開機,每次冷啟動全新 IP)
+
+`relay://` exits forward upstream requests through a tiny authenticated HTTP relay
+deployed on [Modal](https://modal.com) (`modal/relay.py`). The relay container is
+serverless: it wakes on request and every cold boot receives a **practically brand-new
+egress IP** from Modal's cloud pool — so a free-tier quota `429` on one IP is resolved
+by letting the container idle out and booting a fresh one, instead of waiting out a
+possibly hours-long `Retry-After`.
+
+```bash
+# One-time setup (Modal Starter plan is free, $30/mo credits included)
+pip install modal fastapi httpx
+modal setup
+modal secret create zfr-relay RELAY_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(24))")
+
+# Deploy the relay — the printed URL is your relay endpoint
+modal deploy modal/relay.py
+
+# Plug it into the egress pool alongside your other exits
+zfr serve --egress auto,relay://https://<endpoint>.modal.run#key=<RELAY_KEY>
+```
+
+Behavior notes:
+
+- Idle containers are reclaimed after `scaledown_window` (60s by default) at **zero
+  cost**; the next request cold-boots a new container (~seconds with a warm image,
+  longer on the very first boot).
+- On upstream `429` (free-tier quota exhausted), relay exits ignore the long
+  `Retry-After` and cool down for `RELAY_QUOTA_COOLDOWN_SECS` (90s) — just enough for
+  the container to be recycled, so the retry lands on a fresh IP.
+- The `#key=` fragment is stripped from diagnostics; `/v1/egress` never shows it.
+- Upstream status codes, `Retry-After`, rate-limit headers, SSE streams and error
+  bodies are streamed through untouched, so cooldown classification and SSE rewriting
+  behave exactly as with direct/proxy exits.
+- The Starter free credits comfortably cover this duty cycle; the IP pool is
+  datacenter (cloud provider) space, and upstream free-tier terms/anti-abuse handling
+  remain your responsibility to review.
+
+---
+
 ## Background Operation (常駐執行)
 
 ### Daemon mode (no Administrator required)

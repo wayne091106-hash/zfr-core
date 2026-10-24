@@ -89,6 +89,7 @@ async fn handle_models() -> Json<Value> {
             let owned_by = match m.lane {
                 Lane::OpenCodeZen => "opencode-zen",
                 Lane::KiloFree => "kilo-free",
+                Lane::Cline => "cline",
             };
             json!({
                 "id": m.id,

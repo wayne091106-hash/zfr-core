@@ -1,16 +1,18 @@
-//! Model Catalog & Route Lane Definitions for OpenCode and Kilo Endpoints.
+//! Model Catalog & Route Lane Definitions for OpenCode, Kilo and Cline Endpoints.
 
 use serde::{Deserialize, Serialize};
 
 pub const OPENCODE_ZEN_BASE: &str = "https://opencode.ai/inference/openai/v1";
 pub const OPENCODE_LEGACY_BASE: &str = "https://opencode.ai/inference/v1";
 pub const KILO_GATEWAY_BASE: &str = "https://api.kilo.ai/api/gateway/v1";
+pub const CLINE_API_BASE: &str = "https://api.cline.bot/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Lane {
     OpenCodeZen,
     KiloFree,
+    Cline,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,10 +213,61 @@ pub fn builtin_catalog() -> Vec<ModelEntry> {
             vision: false,
             reasoning: true,
         },
+        // Cline Lane (api.cline.bot — OpenAI-compatible; free models carry the
+        // `cline-free/` prefix or a partner `:free` id; per-model limits rotate).
+        // Context windows below are best-effort from Cline's own model cache.
+        ModelEntry {
+            id: "z-ai/glm-5.3-flash".into(),
+            lane: Lane::Cline,
+            context_window: 204_800,
+            max_output: 131_072,
+            vision: false,
+            reasoning: true,
+        },
+        ModelEntry {
+            id: "cline-free/deepseek-v4.1-flash".into(),
+            lane: Lane::Cline,
+            context_window: 1_000_000,
+            max_output: 65_536,
+            vision: false,
+            reasoning: true,
+        },
+        ModelEntry {
+            id: "cline-free/mimo-v2.6-flash".into(),
+            lane: Lane::Cline,
+            context_window: 262_144,
+            max_output: 65_536,
+            vision: false,
+            reasoning: true,
+        },
+        ModelEntry {
+            id: "cline-free/muse-spark-1.3-contributor".into(),
+            lane: Lane::Cline,
+            context_window: 262_144,
+            max_output: 65_536,
+            vision: true,
+            reasoning: true,
+        },
+        ModelEntry {
+            id: "cline-free/solar-pro4".into(),
+            lane: Lane::Cline,
+            context_window: 131_072,
+            max_output: 32_768,
+            vision: false,
+            reasoning: true,
+        },
+        ModelEntry {
+            id: "poolside/laguna-s-2.1:free".into(),
+            lane: Lane::Cline,
+            context_window: 262_144,
+            max_output: 65_536,
+            vision: false,
+            reasoning: true,
+        },
     ]
 }
 
-/// Resolve a model string (including optional `opencode/` or `kilo/` prefix or role alias)
+/// Resolve a model string (including optional `opencode/`, `kilo/` or `cline/` prefix or role alias)
 /// into `(Lane, canonical_model_id)`.
 pub fn resolve_model(raw: &str) -> (Lane, String) {
     let trimmed = raw.trim();
@@ -233,6 +286,9 @@ pub fn resolve_model(raw: &str) -> (Lane, String) {
     }
     if let Some(rest) = base.strip_prefix("kilo/") {
         return (Lane::KiloFree, rest.to_string());
+    }
+    if let Some(rest) = base.strip_prefix("cline/") {
+        return (Lane::Cline, rest.to_string());
     }
 
     match base {
@@ -317,6 +373,23 @@ mod tests {
         assert_eq!(
             resolve_model("beam-free(fast)"),
             (Lane::OpenCodeZen, "beam-free".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_cline_prefix() {
+        assert_eq!(
+            resolve_model("cline/z-ai/glm-5.3-flash"),
+            (Lane::Cline, "z-ai/glm-5.3-flash".to_string())
+        );
+        assert_eq!(
+            resolve_model("cline/cline-free/mimo-v2.6-flash"),
+            (Lane::Cline, "cline-free/mimo-v2.6-flash".to_string())
+        );
+        // Without the `cline/` prefix, `provider/model` ids still resolve to the Kilo lane.
+        assert_eq!(
+            resolve_model("z-ai/glm-5.3-flash"),
+            (Lane::KiloFree, "z-ai/glm-5.3-flash".to_string())
         );
     }
 

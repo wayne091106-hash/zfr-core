@@ -43,6 +43,20 @@ pub struct EgressNode {
     pub id: String,
     pub spec: String,
     pub client: Client,
+    /// Set for `relay://` exits: instead of a local proxy socket, upstream requests
+    /// are forwarded as JSON envelopes through an HTTP relay endpoint (e.g. a Modal
+    /// serverless container that boots on demand and yields a fresh egress IP on
+    /// every cold start — see `modal/relay.py`).
+    pub relay: Option<RelayConfig>,
+}
+
+/// Connection parameters of a `relay://<https-url>[#key=<secret>]` egress exit.
+#[derive(Debug, Clone)]
+pub struct RelayConfig {
+    /// HTTPS endpoint of the relay (the `relay://` scheme prefix is stripped).
+    pub url: String,
+    /// Optional shared secret, sent to the relay as `x-zfr-relay-key`.
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +97,8 @@ impl EgressPool {
     /// - `"direct"` (default OS routing table)
     /// - `"http://127.0.0.1:7890"` / `"socks5://127.0.0.1:1080"` (proxy transport endpoints)
     /// - `"bind://192.168.31.135"` (bind socket to a specific local interface IP)
+    /// - `"relay://https://relay-host[#key=<secret>]"` (serverless HTTP relay with a fresh
+    ///   egress IP per cold boot, e.g. Modal — see `modal/relay.py`)
     pub fn new(specs: &[String]) -> Self {
         let mut expanded = Vec::new();
         for raw in specs {
@@ -96,15 +112,22 @@ impl EgressPool {
         }
         let mut nodes = Vec::new();
         for (idx, spec) in expanded.iter().enumerate() {
+            let relay = parse_relay_spec(spec);
+            // Relay specs never leak their `#key=` fragment into diagnostics.
+            let stored_spec = relay
+                .as_ref()
+                .map(|r| format!("relay://{}", r.url))
+                .unwrap_or_else(|| spec.clone());
             if let Ok(client) = build_client_for_spec(spec) {
-                let id = match spec.as_str() {
-                    "direct" | "ipv6" | "ipv4" => spec.clone(),
-                    _ => format!("exit-{idx}:{spec}"),
+                let id = match stored_spec.as_str() {
+                    "direct" | "ipv6" | "ipv4" => stored_spec.clone(),
+                    _ => format!("exit-{idx}:{stored_spec}"),
                 };
                 nodes.push(EgressNode {
                     id,
-                    spec: spec.clone(),
+                    spec: stored_spec,
                     client,
+                    relay,
                 });
             }
         }
@@ -113,6 +136,7 @@ impl EgressPool {
                 id: "direct".to_string(),
                 spec: "direct".to_string(),
                 client: build_client_for_spec("direct").expect("default reqwest client"),
+                relay: None,
             });
         }
         Self {
@@ -183,7 +207,18 @@ impl EgressPool {
         retry_after_secs: Option<u64>,
         detail: impl Into<String>,
     ) {
+        // Relay exits get a fresh egress IP on every cold boot, so an hours-long
+        // upstream `Retry-After` would idle a route that a container recycle would
+        // have healed. Cool down only long enough for the relay container to be
+        // reclaimed (see SCALEDOWN_WINDOW_SECS in modal/relay.py).
+        let is_relay = self
+            .nodes
+            .iter()
+            .any(|n| n.id == exit_id && n.relay.is_some());
         let base_ttl = match class {
+            FailureClass::Quota429 if is_relay => {
+                Duration::from_secs(RELAY_QUOTA_COOLDOWN_SECS)
+            }
             FailureClass::Quota429 => {
                 Duration::from_secs(retry_after_secs.unwrap_or(1800).clamp(30, 86400))
             }
@@ -266,6 +301,30 @@ impl CooldownEntry {
     }
 }
 
+/// Cooldown applied to relay exits on upstream quota `429` responses.
+///
+/// Deliberately longer than `SCALEDOWN_WINDOW_SECS` (60s) in `modal/relay.py`:
+/// by the time the cooldown expires, the relay container has been reclaimed and
+/// the retry cold-boots onto a fresh egress IP with a clean quota window.
+const RELAY_QUOTA_COOLDOWN_SECS: u64 = 90;
+
+/// Parse a `relay://<https-url>[#key=<secret>]` egress spec.
+///
+/// Returns `None` for any other spec shape. The `#key=` fragment (if present)
+/// is stripped from the stored spec so it never leaks into `/v1/egress`
+/// diagnostics or logs.
+fn parse_relay_spec(spec: &str) -> Option<RelayConfig> {
+    let rest = spec.strip_prefix("relay://")?;
+    let (url, key) = match rest.split_once("#key=") {
+        Some((u, k)) => (u.trim().to_string(), Some(k.trim().to_string())),
+        None => (rest.trim().to_string(), None),
+    };
+    if url.is_empty() {
+        return None;
+    }
+    Some(RelayConfig { url, key })
+}
+
 fn build_client_for_spec(spec: &str) -> Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(20))
@@ -287,6 +346,11 @@ fn build_client_for_spec(spec: &str) -> Result<Client, reqwest::Error> {
         if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
             builder = builder.local_address(ip);
         }
+    } else if spec.starts_with("relay://") {
+        // Relay exits reach a stable public HTTPS endpoint; the rotating egress IP
+        // lives on the relay container itself. Allow a longer connect window so a
+        // cold-booted relay container (a few seconds) never trips the timeout.
+        builder = builder.connect_timeout(Duration::from_secs(60));
     } else if spec != "direct" {
         let clean_proxy = spec.trim_end_matches("#pool");
         let proxy = reqwest::Proxy::all(clean_proxy)?;
@@ -382,5 +446,32 @@ mod tests {
         assert!(pool.model_has_healthy_exit("m"), "one healthy exit left");
         pool.report_failure("ipv4", "m", FailureClass::Transport, None, "x");
         assert!(!pool.model_has_healthy_exit("m"), "all exits cooled down");
+    }
+
+    #[test]
+    fn relay_spec_parses_and_strips_key_from_diagnostics() {
+        let pool = EgressPool::new(&["relay://https://x.modal.run#key=hunter2".to_string()]);
+        assert_eq!(pool.nodes().len(), 1);
+        let node = &pool.nodes()[0];
+        assert_eq!(node.spec, "relay://https://x.modal.run");
+        assert!(
+            !node.spec.contains("hunter2"),
+            "the #key fragment must never leak into the stored spec"
+        );
+        let relay = node.relay.as_ref().expect("relay config parsed");
+        assert_eq!(relay.url, "https://x.modal.run");
+        assert_eq!(relay.key.as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn relay_quota_cooldown_is_clamped_to_boot_window() {
+        let pool = EgressPool::new(&["relay://https://x.modal.run".to_string()]);
+        let exit_id = pool.nodes()[0].id.clone();
+        pool.report_failure(&exit_id, "m", FailureClass::Quota429, Some(40000), "quota");
+        let remaining = pool.active_cooldowns()[0].remaining_secs;
+        assert!(
+            (RELAY_QUOTA_COOLDOWN_SECS - 10..=RELAY_QUOTA_COOLDOWN_SECS).contains(&remaining),
+            "relay quota window must track the container recycle window, not Retry-After: {remaining}s"
+        );
     }
 }

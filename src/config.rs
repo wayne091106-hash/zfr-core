@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// Listen address for the gateway, e.g. `"127.0.0.1:18788"`.
     pub bind: Option<SocketAddr>,
-    /// Egress specs: `auto`, `direct`, `ipv6`, `ipv4`, `http://...`, `socks5://...`, `bind://...`.
+    /// Egress specs: `auto`, `direct`, `ipv6`, `ipv4`, `http://...`, `socks5://...`, `bind://...`,
+    /// `relay://https://relay-host#key=...` (serverless fresh-IP egress, see modal/relay.py).
     pub egress: Option<Vec<String>>,
     /// Disable cross-model automatic failover.
     pub no_failover: Option<bool>,

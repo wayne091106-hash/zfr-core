@@ -1,7 +1,8 @@
 //! Core Request Router, Multi-Homed Dispatcher & Upstream SSE Stream Normalization.
 
 use crate::catalog::{
-    builtin_catalog, failover_chain, resolve_model, Lane, KILO_GATEWAY_BASE, OPENCODE_ZEN_BASE,
+    builtin_catalog, failover_chain, resolve_model, Lane, CLINE_API_BASE, KILO_GATEWAY_BASE,
+    OPENCODE_ZEN_BASE,
 };
 use crate::egress::{EgressNode, EgressPool, FailureClass};
 use crate::fingerprint::{
@@ -306,18 +307,70 @@ impl Router {
                     },
                 )
             }
+            Lane::Cline => {
+                let downstream_wants_stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // api.cline.bot speaks standard OpenAI wire format; upstream is
+                // always SSE so the shared aggregation/streaming paths apply.
+                body["stream"] = json!(true);
+                let token = std::env::var("ZFR_CLINE_TOKEN")
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty());
+                let Some(token) = token else {
+                    return Err((
+                        500u16,
+                        FailureClass::Transport,
+                        None,
+                        "cline lane requires ZFR_CLINE_TOKEN (create an API key at app.cline.bot)"
+                            .to_string(),
+                    ));
+                };
+                let hdrs = vec![
+                    ("Authorization".into(), format!("Bearer {token}")),
+                    ("Content-Type".into(), "application/json".into()),
+                    ("Accept".into(), "text/event-stream".into()),
+                ];
+                (
+                    format!("{CLINE_API_BASE}/chat/completions"),
+                    hdrs,
+                    FingerprintPlan {
+                        downstream_wants_stream,
+                        drop_placeholder_tool_calls: false,
+                        aliased_client_tools: false,
+                    },
+                )
+            }
         };
 
         let payload_bytes = match lane {
             Lane::OpenCodeZen => encode_v2_chat_body(&body).into_bytes(),
             Lane::KiloFree => serde_json::to_vec(&body).unwrap_or_default(),
+            Lane::Cline => serde_json::to_vec(&body).unwrap_or_default(),
         };
-        let mut rb = exit.client.post(&url).body(payload_bytes);
-        for (k, v) in headers {
-            rb = rb.header(k, v);
-        }
 
-        let resp = rb.send().await.map_err(|e| {
+        // Relay exits wrap the upstream request into a JSON envelope and let the
+        // relay container perform it from its own (freshly booted) egress IP; the
+        // upstream status, Retry-After and body are streamed back untouched, so
+        // the failure-classification path below is shared with direct exits.
+        let send = if let Some(relay) = &exit.relay {
+            let envelope = build_relay_envelope(&url, &headers, &payload_bytes);
+            let mut rb = exit.client.post(&relay.url).json(&envelope);
+            if let Some(key) = &relay.key {
+                rb = rb.header("x-zfr-relay-key", key);
+            }
+            rb
+        } else {
+            let mut rb = exit.client.post(&url).body(payload_bytes);
+            for (k, v) in headers {
+                rb = rb.header(k, v);
+            }
+            rb
+        };
+
+        let resp = send.send().await.map_err(|e| {
             (
                 502u16,
                 FailureClass::Transport,
@@ -341,6 +394,22 @@ impl Router {
 
         Ok((resp, plan))
     }
+}
+
+/// Wrap an upstream request into the JSON envelope understood by `modal/relay.py`:
+/// the relay performs the request from its own egress IP and streams the upstream
+/// status, selected headers and body straight back.
+fn build_relay_envelope(url: &str, headers: &[(String, String)], payload: &[u8]) -> Value {
+    let mut hdrs = serde_json::Map::new();
+    for (k, v) in headers {
+        hdrs.insert(k.clone(), Value::String(v.clone()));
+    }
+    json!({
+        "method": "POST",
+        "url": url,
+        "headers": Value::Object(hdrs),
+        "body": String::from_utf8_lossy(payload),
+    })
 }
 
 fn classify_http_failure(status: u16, body: &str) -> FailureClass {
@@ -671,5 +740,23 @@ mod tests {
             rewrite_sse_line(":keepalive", &plan).as_deref(),
             Some(":keepalive")
         );
+    }
+
+    #[test]
+    fn relay_envelope_carries_url_headers_and_body() {
+        let headers = vec![
+            ("Authorization".to_string(), "Bearer anonymous".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        let v = build_relay_envelope(
+            "https://up.example/chat/completions",
+            &headers,
+            br#"{"a":1}"#,
+        );
+        assert_eq!(v["method"], "POST");
+        assert_eq!(v["url"], "https://up.example/chat/completions");
+        assert_eq!(v["headers"]["Authorization"], "Bearer anonymous");
+        assert_eq!(v["headers"]["Content-Type"], "application/json");
+        assert_eq!(v["body"], r#"{"a":1}"#);
     }
 }

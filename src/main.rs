@@ -27,7 +27,8 @@ const DEFAULT_PROBE_INTERVAL: u64 = 300;
 )]
 struct Cli {
     /// Comma-separated or repeated egress specs: `auto` (IPv6+IPv4 dual-stack), `direct`,
-    /// `ipv6`, `ipv4`, `http://host:port`, `socks5://host:port`, or `bind://192.168.x.x`
+    /// `ipv6`, `ipv4`, `http://host:port`, `socks5://host:port`, `bind://192.168.x.x`, or
+    /// `relay://https://relay-host#key=SECRET` (serverless egress, fresh IP per cold boot)
     #[arg(long = "egress", short = 'e', global = true, value_delimiter = ',', env = "ZFR_EGRESS")]
     egress: Option<Vec<String>>,
 
@@ -355,6 +356,7 @@ async fn run_probe(router: &Arc<Router>) {
         let lane_str = match r.lane {
             Lane::OpenCodeZen => "opencode-zen",
             Lane::KiloFree => "kilo-free   ",
+            Lane::Cline => "cline       ",
         };
         println!(
             "  [{tag}] {lane_str} | {:42} | HTTP {:3} ({:4}ms) via {:12} | {}",
