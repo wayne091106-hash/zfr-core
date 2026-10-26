@@ -44,6 +44,17 @@ pub fn build_app(state: AppState) -> AxumRouter {
         .with_state(state)
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let exempt = matches!(req.uri().path(), "/health" | "/v1/health");
     if let (Some(key), false) = (state.api_key.as_ref(), exempt) {
@@ -51,7 +62,10 @@ async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
-        let authorized = provided == Some(&format!("Bearer {key}"));
+        let expected = format!("Bearer {key}");
+        let authorized = provided
+            .map(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
+            .unwrap_or(false);
         if !authorized {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -90,6 +104,9 @@ async fn handle_models() -> Json<Value> {
                 Lane::OpenCodeZen => "opencode-zen",
                 Lane::KiloFree => "kilo-free",
                 Lane::Cline => "cline",
+                Lane::GroqFree => "groq-free",
+                Lane::NvidiaFree => "nvidia-free",
+                Lane::OpenRouterFree => "openrouter-free",
             };
             json!({
                 "id": m.id,

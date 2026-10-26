@@ -286,9 +286,12 @@ pub fn apply_fingerprint(body: &mut Value) -> FingerprintPlan {
     }
     body["tools"] = json!(out_tools);
 
-    // 3b. OpenCode 2.x client sets `max_completion_tokens: 32000` when no token ceiling is given
-    if body.get("max_completion_tokens").is_none() && body.get("max_tokens").is_none() {
-        body["max_completion_tokens"] = json!(32000);
+    // 3b. OpenCode 2.x client always sends `max_completion_tokens` (default 32000) and never `max_tokens`.
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(mt) = obj.remove("max_tokens") {
+            obj.entry("max_completion_tokens").or_insert(mt);
+        }
+        obj.entry("max_completion_tokens").or_insert(json!(32000));
     }
 
     let aliased = aliased_read || aliased_shell;

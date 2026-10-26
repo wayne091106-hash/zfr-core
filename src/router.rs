@@ -1,8 +1,8 @@
 //! Core Request Router, Multi-Homed Dispatcher & Upstream SSE Stream Normalization.
 
 use crate::catalog::{
-    builtin_catalog, failover_chain, resolve_model, Lane, CLINE_API_BASE, KILO_GATEWAY_BASE,
-    OPENCODE_ZEN_BASE,
+    builtin_catalog, failover_chain, resolve_model, Lane, CLINE_API_BASE, GROQ_API_BASE,
+    KILO_GATEWAY_BASE, NVIDIA_API_BASE, OPENCODE_ZEN_BASE, OPENROUTER_API_BASE,
 };
 use crate::egress::{EgressNode, EgressPool, FailureClass};
 use crate::fingerprint::{
@@ -210,8 +210,17 @@ impl Router {
         };
 
         let mut last_err: (u16, String) = (502, "no upstream candidates".into());
+        let any_healthy = chain.len() > 1
+            && chain
+                .iter()
+                .any(|(_, m)| self.egress.model_has_healthy_exit(m));
 
-        for (lane, model_id) in chain {
+        for (lane, model_id) in &chain {
+            let lane = *lane;
+            let model_id = model_id.clone();
+            if any_healthy && !self.egress.model_has_healthy_exit(&model_id) {
+                continue;
+            }
             let exits = self
                 .egress
                 .candidates_for(&conv_seed, &model_id, self.max_exit_retries);
@@ -247,6 +256,22 @@ impl Router {
                             retry_after,
                             &detail,
                         );
+                        if lane == Lane::OpenCodeZen
+                            && class == FailureClass::Quota429
+                            && detail.to_ascii_lowercase().contains("free usage limit")
+                        {
+                            for (other_lane, other_model) in &chain {
+                                if *other_lane == Lane::OpenCodeZen && *other_model != model_id {
+                                    self.egress.report_failure(
+                                        &exit.id,
+                                        other_model,
+                                        class,
+                                        retry_after,
+                                        &detail,
+                                    );
+                                }
+                            }
+                        }
                         last_err = (status.max(400), detail);
                     }
                 }
@@ -343,12 +368,57 @@ impl Router {
                     },
                 )
             }
+            Lane::GroqFree | Lane::NvidiaFree | Lane::OpenRouterFree => {
+                let downstream_wants_stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                body["stream"] = json!(true);
+                let (base_url, env_name) = match lane {
+                    Lane::GroqFree => (GROQ_API_BASE, "GROQ_API_KEY"),
+                    Lane::NvidiaFree => (NVIDIA_API_BASE, "NVIDIA_API_KEY"),
+                    Lane::OpenRouterFree => (OPENROUTER_API_BASE, "OPENROUTER_API_KEY"),
+                    _ => unreachable!(),
+                };
+                let token = std::env::var(env_name)
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| {
+                        (
+                            500u16,
+                            FailureClass::Transport,
+                            None,
+                            format!("{lane:?} lane requires {env_name}"),
+                        )
+                    })?;
+                let mut hdrs = vec![
+                    ("Authorization".into(), format!("Bearer {token}")),
+                    ("Content-Type".into(), "application/json".into()),
+                    ("Accept".into(), "text/event-stream".into()),
+                ];
+                if lane == Lane::OpenRouterFree {
+                    hdrs.push(("X-Title".into(), "ZFR Core".into()));
+                }
+                (
+                    format!("{base_url}/chat/completions"),
+                    hdrs,
+                    FingerprintPlan {
+                        downstream_wants_stream,
+                        drop_placeholder_tool_calls: false,
+                        aliased_client_tools: false,
+                    },
+                )
+            }
         };
 
         let payload_bytes = match lane {
             Lane::OpenCodeZen => encode_v2_chat_body(&body).into_bytes(),
-            Lane::KiloFree => serde_json::to_vec(&body).unwrap_or_default(),
-            Lane::Cline => serde_json::to_vec(&body).unwrap_or_default(),
+            Lane::KiloFree
+            | Lane::Cline
+            | Lane::GroqFree
+            | Lane::NvidiaFree
+            | Lane::OpenRouterFree => serde_json::to_vec(&body).unwrap_or_default(),
         };
 
         // Relay exits wrap the upstream request into a JSON envelope and let the

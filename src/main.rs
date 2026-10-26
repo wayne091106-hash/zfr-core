@@ -155,6 +155,7 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Config::load_bundled_env();
     let Cli {
         egress,
         api_key,
@@ -357,6 +358,9 @@ async fn run_probe(router: &Arc<Router>) {
             Lane::OpenCodeZen => "opencode-zen",
             Lane::KiloFree => "kilo-free   ",
             Lane::Cline => "cline       ",
+            Lane::GroqFree => "groq-free   ",
+            Lane::NvidiaFree => "nvidia-free ",
+            Lane::OpenRouterFree => "openrouter  ",
         };
         println!(
             "  [{tag}] {lane_str} | {:42} | HTTP {:3} ({:4}ms) via {:12} | {}",

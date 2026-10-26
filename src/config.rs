@@ -30,8 +30,38 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load `.env` files from standard locations (`./.env`, `./.raphael/.env`, `~/.raphael/.env`,
+    /// `%LOCALAPPDATA%/zfr/.env`) so standalone `zfr` automatically picks up free-pool keys.
+    pub fn load_bundled_env() {
+        let mut paths = vec![PathBuf::from(".env"), PathBuf::from(".raphael").join(".env")];
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from) {
+            paths.push(home.join(".raphael").join(".env"));
+        }
+        if let Ok(la) = std::env::var("LOCALAPPDATA") {
+            paths.push(PathBuf::from(la).join("zfr").join(".env"));
+        }
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            for raw_line in text.lines() {
+                let line = raw_line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let line = line.strip_prefix("export ").unwrap_or(line).trim();
+                if let Some((k, v)) = line.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches('"').trim_matches('\'');
+                    if !key.is_empty() && std::env::var_os(key).is_none() {
+                        std::env::set_var(key, val);
+                    }
+                }
+            }
+        }
+    }
+
     /// Load the effective configuration file, if any. Returns `(config, path)`.
     pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>), String> {
+        Self::load_bundled_env();
         let path = match explicit {
             Some(p) => {
                 if !p.exists() {

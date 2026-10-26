@@ -1,4 +1,5 @@
-//! Model Catalog & Route Lane Definitions for OpenCode, Kilo and Cline Endpoints.
+//! Model Catalog & Route Lane Definitions for OpenCode Zen (built-in native wire engine),
+//! Kilo Free Pool, Cline, Groq Free, NVIDIA NIM Free, and OpenRouter Free Endpoints.
 
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +7,9 @@ pub const OPENCODE_ZEN_BASE: &str = "https://opencode.ai/inference/openai/v1";
 pub const OPENCODE_LEGACY_BASE: &str = "https://opencode.ai/inference/v1";
 pub const KILO_GATEWAY_BASE: &str = "https://api.kilo.ai/api/gateway/v1";
 pub const CLINE_API_BASE: &str = "https://api.cline.bot/v1";
+pub const GROQ_API_BASE: &str = "https://api.groq.com/openai/v1";
+pub const NVIDIA_API_BASE: &str = "https://integrate.api.nvidia.com/v1";
+pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -13,6 +17,9 @@ pub enum Lane {
     OpenCodeZen,
     KiloFree,
     Cline,
+    GroqFree,
+    NvidiaFree,
+    OpenRouterFree,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +297,21 @@ pub fn resolve_model(raw: &str) -> (Lane, String) {
     if let Some(rest) = base.strip_prefix("cline/") {
         return (Lane::Cline, rest.to_string());
     }
+    if let Some(rest) = base.strip_prefix("groq/") {
+        return (Lane::GroqFree, rest.to_string());
+    }
+    if let Some(rest) = base.strip_prefix("nvidia/") {
+        if rest.ends_with(":free") {
+            return (Lane::KiloFree, format!("nvidia/{rest}"));
+        }
+        return (Lane::NvidiaFree, rest.to_string());
+    }
+    if let Some(rest) = base.strip_prefix("openrouter/") {
+        if rest == "free" {
+            return (Lane::KiloFree, "openrouter/free".to_string());
+        }
+        return (Lane::OpenRouterFree, rest.to_string());
+    }
 
     match base {
         "auto" | "main" | "fast" => (Lane::OpenCodeZen, "beam-free".to_string()),
@@ -303,26 +325,101 @@ pub fn resolve_model(raw: &str) -> (Lane, String) {
     }
 }
 
+/// Direct Kilo Gateway equivalent for an OpenCode Zen model ID, when the same model
+/// (or model family) is hosted on both lanes.
+pub fn kilo_equivalent(opencode_id: &str) -> Option<&'static str> {
+    match opencode_id {
+        "beam-free" => Some("reflection/beam-free"),
+        "nemotron-3-ultra-free" => Some("nvidia/nemotron-3-ultra-550b-a55b:free"),
+        "nemotron-3.5-lightning-free" => Some("nvidia/nemotron-3.5-lightning:free"),
+        "nemotron-3.5-super-vl-free" => Some("nvidia/nemotron-3.5-super-vl:free"),
+        "nemotron-3-super-free" => Some("nvidia/nemotron-3-super-120b-a12b:free"),
+        "mimo-v2.6-flash-free" => Some("xiaomi/mimo-v2.6-flash:free"),
+        "mimo-v2-pro-free" => Some("xiaomi/mimo-v2-pro:free"),
+        "mimo-v2-omni-free" => Some("xiaomi/mimo-v2-omni:free"),
+        "minimax-m3.1-flash-free" => Some("minimax/minimax-m3.1-flash:free"),
+        "minimax-m2.5-free" => Some("minimax/minimax-m2.5:free"),
+        "north-mini-code-free" => Some("cohere/north-mini-code:free"),
+        "qwen3.6-plus-free" => Some("qwen/qwen3.6-plus:free"),
+        _ => None,
+    }
+}
+
+/// Direct OpenCode Zen equivalent for a Kilo Gateway model ID, when hosted on both keyless lanes.
+pub fn opencode_equivalent(kilo_id: &str) -> Option<&'static str> {
+    match kilo_id {
+        "reflection/beam-free" => Some("beam-free"),
+        "nvidia/nemotron-3-ultra-550b-a55b:free" => Some("nemotron-3-ultra-free"),
+        "nvidia/nemotron-3.5-lightning:free" => Some("nemotron-3.5-lightning-free"),
+        "nvidia/nemotron-3.5-super-vl:free" => Some("nemotron-3.5-super-vl-free"),
+        "xiaomi/mimo-v2.6-flash:free" => Some("mimo-v2.6-flash-free"),
+        _ => None,
+    }
+}
+
+fn has_env_key(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Ordered failover chain when all egress paths for `primary` are unavailable.
+/// Bundles keyless OpenCode Zen + Kilo Free Pool first, plus optional Groq / NVIDIA / OpenRouter
+/// free channels when their keys are present in the environment.
 pub fn failover_chain(primary: &str) -> Vec<(Lane, String)> {
     let (primary_lane, primary_id) = resolve_model(primary);
     let mut chain = vec![(primary_lane, primary_id.clone())];
 
+    if primary_lane == Lane::OpenCodeZen {
+        if let Some(twin) = kilo_equivalent(&primary_id) {
+            chain.push((Lane::KiloFree, twin.to_string()));
+        }
+    } else if primary_lane == Lane::KiloFree {
+        if let Some(twin) = opencode_equivalent(&primary_id) {
+            chain.push((Lane::OpenCodeZen, twin.to_string()));
+        }
+    }
+
     let defaults = [
-        (Lane::OpenCodeZen, "beam-free"),
-        (Lane::OpenCodeZen, "nemotron-3-ultra-free"),
-        (Lane::OpenCodeZen, "cat-jam-free"),
-        (Lane::OpenCodeZen, "nemotron-3.5-lightning-free"),
         (Lane::KiloFree, "kilo-auto/free"),
         (Lane::KiloFree, "reflection/beam-free"),
         (Lane::KiloFree, "nvidia/nemotron-3.5-super-vl:free"),
+        (Lane::OpenCodeZen, "beam-free"),
+        (Lane::OpenCodeZen, "nemotron-3-ultra-free"),
+        (Lane::OpenCodeZen, "deepseek-v4.1-flash-free"),
+        (Lane::OpenCodeZen, "glm-5.3-flash-free"),
+        (Lane::OpenCodeZen, "cat-jam-free"),
+        (Lane::OpenCodeZen, "nemotron-3.5-lightning-free"),
     ];
 
     for (lane, id) in defaults {
-        if !(lane == primary_lane && id == primary_id) {
+        if !chain.iter().any(|(l, m)| *l == lane && m == id) {
             chain.push((lane, id.to_string()));
         }
     }
+
+    if has_env_key("NVIDIA_API_KEY") {
+        for id in ["z-ai/glm-5.3-flash", "deepseek-ai/deepseek-v4.1-flash"] {
+            if !chain.iter().any(|(l, m)| *l == Lane::NvidiaFree && m == id) {
+                chain.push((Lane::NvidiaFree, id.to_string()));
+            }
+        }
+    }
+    if has_env_key("GROQ_API_KEY") {
+        for id in ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"] {
+            if !chain.iter().any(|(l, m)| *l == Lane::GroqFree && m == id) {
+                chain.push((Lane::GroqFree, id.to_string()));
+            }
+        }
+    }
+    if has_env_key("OPENROUTER_API_KEY") {
+        for id in ["minimax/minimax-m3.1-flash:free", "cohere/north-mini-code:free"] {
+            if !chain.iter().any(|(l, m)| *l == Lane::OpenRouterFree && m == id) {
+                chain.push((Lane::OpenRouterFree, id.to_string()));
+            }
+        }
+    }
+
     chain
 }
 
